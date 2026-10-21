@@ -105,6 +105,21 @@ JSON 结构长这样，字段随意增删：
 **通用参数**：`--pass`、`--url`、`--file`、`--local`
 **环境变量**：`VAULT_PASS`、`VAULT_URL`、`GITHUB_TOKEN`
 
+## 刚推送完却说「口令错误」？
+
+不是口令问题，是 `raw.githubusercontent.com` 的 **CDN 缓存**还在吐旧版密文，
+刚 `push` 完的几分钟内尤其容易碰到。
+
+工具会自己兜住：raw 地址解不开时自动改走 GitHub Contents API 重试一次，
+成功后你会看到一行提示：
+
+```
+提示：raw CDN 返回的是旧版密文，已自动改走 GitHub API 取到最新版
+```
+
+看到这行说明已经取到最新版了，忽略即可。过一阵子 CDN 追上就安静了。
+注意 Contents API 匿名调用限 60 次/小时，正常取密码用不完。
+
 ## 想改成私有仓库？
 
 可以，但拉取就要带 GitHub token 了（`VAULT_URL` 里没法塞 header，需要改 `load_blob` 加鉴权头）。
