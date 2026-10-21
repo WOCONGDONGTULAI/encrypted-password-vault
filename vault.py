@@ -56,7 +56,7 @@ ITERATIONS = 200_000
 
 REPO_RAW = "https://raw.githubusercontent.com/WOCONGDONGTULAI/encrypted-password-vault/main"
 DEFAULT_URL = REPO_RAW + "/vault.enc"
-DEFAULT_FILE = "vault.enc"
+DEFAULT_FILE = os.environ.get("VAULT_FILE") or "vault.enc"
 
 ENV_PASS = "VAULT_PASS"
 ENV_URL = "VAULT_URL"
