@@ -93,31 +93,41 @@ JSON 结构长这样，字段随意增删：
 
 | 命令 | 作用 |
 |---|---|
-| `list` | 列出所有条目名、用户名、备注 |
-| `get KEY...` | 取某条目密码，加 `--user` 连用户名一起输出 |
+| `list [--json]` | 列出条目名、用户名、备注 |
+| `get KEY... [--json]` | 取某条目密码，加 `--user` 连用户名一起输出 |
+| `set KEY --username … --password … [--push]` | **新增或更新**一条（幂等，写入主要用这个） |
+| `rm KEY [--push]` | 删除一条 |
 | `dump` | 导出全部明文 JSON |
 | `encrypt IN.json -o vault.enc` | 明文 JSON → 密文 |
 | `decrypt` | 密文 → 明文 JSON（结果只在终端） |
 | `edit` | 解密 → 编辑器改 → 自动重加密 |
-| `push` | 密文推到 GitHub（需 `GITHUB_TOKEN`） |
+| `push` | 把本地密文推到 GitHub（需 `GITHUB_TOKEN`） |
 | `selftest` | 算法自检（加密往返 / 错误口令 / 篡改检测） |
+
+加 `--json` 就输出单行 JSON，**给脚本或 AI 解析时一律加上**，别去解析人读的排版文本。
 
 **通用参数**：`--pass`、`--url`、`--file`、`--local`
 **环境变量**：`VAULT_PASS`、`VAULT_URL`、`GITHUB_TOKEN`
 
-## 刚推送完却说「口令错误」？
+注意 `set` / `rm` 里条目的网址字段是 `--url`，远端地址改用 **`--remote-url`**。
 
-不是口令问题，是 `raw.githubusercontent.com` 的 **CDN 缓存**还在吐旧版密文，
-刚 `push` 完的几分钟内尤其容易碰到。
+## 让 AI / Agent 来操作
 
-工具会自己兜住：raw 地址解不开时自动改走 GitHub Contents API 重试一次，
-成功后你会看到一行提示：
+仓库里有 **[AGENTS.md](./AGENTS.md)**，专门给被调用来的 AI 看：
+写了怎么取工具、怎么配环境变量、怎么读怎么写、以及哪些红线不能碰
+（不许把口令或明文落盘、不许提交明文 JSON、出错别猜口令）。
 
-```
-提示：raw CDN 返回的是旧版密文，已自动改走 GitHub API 取到最新版
-```
+**读取**只需要口令，不需要 token；**写入**才需要 `GITHUB_TOKEN`。
 
-看到这行说明已经取到最新版了，忽略即可。过一阵子 CDN 追上就安静了。
+## 刚推送完却读到旧数据？
+
+不是口令问题，是 `raw.githubusercontent.com` 的 **CDN 缓存**在吐旧版密文，
+刚 `push` 完的几分钟内尤其容易碰到。而且它返回的是「有效但过期」的密文——
+能被正常解开，只是内容落后，所以单靠解析失败是检测不出来的。
+
+因此工具**默认就走 GitHub Contents API**（权威、无 CDN 缓存），
+API 不可用（如匿名限流）时才退回 raw 地址。所以这个问题基本已经拦住了。
+
 注意 Contents API 匿名调用限 60 次/小时，正常取密码用不完。
 
 ## 想改成私有仓库？
