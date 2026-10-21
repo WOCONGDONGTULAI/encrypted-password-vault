@@ -1,0 +1,13 @@
+{
+  "example-github": {
+    "username": "WOCONGDONGTULAI",
+    "password": "change-me-please",
+    "url": "https://github.com",
+    "note": "示例条目，动手改成你自己的"
+  },
+  "example-email": {
+    "username": "someone@example.com",
+    "password": "another-placeholder",
+    "note": "示例条目"
+  }
+}
