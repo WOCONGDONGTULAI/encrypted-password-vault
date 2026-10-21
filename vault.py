@@ -39,6 +39,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import struct
 import subprocess
@@ -118,11 +119,21 @@ def decrypt_bytes(blob: bytes, passphrase: bytes) -> bytes:
 # ---------------------------------------------------------------- 读写辅助
 
 def load_blob(source: str) -> bytes:
-    """从 URL 或本地文件读取密文，自动识别 base64 / 二进制"""
+    """从 URL 或本地文件读取密文，自动识别 base64 / 二进制 / GitHub API JSON"""
     if source.startswith("http://") or source.startswith("https://"):
-        req = urllib.request.Request(source, headers={"User-Agent": "vault.py"})
+        req = urllib.request.Request(source, headers={
+            "User-Agent": "vault.py",
+            "Accept": "application/vnd.github+json",
+        })
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = resp.read()
+        # GitHub Contents API 返回 JSON，密文在 base64 的 content 字段里
+        if data[:1] == b"{":
+            info = json.loads(data.decode("utf-8"))
+            if "content" in info:
+                data = base64.b64decode(info["content"])
+            elif "message" in info:
+                raise ValueError("GitHub API: %s" % info["message"])
     else:
         with open(source, "rb") as f:
             data = f.read()
@@ -191,10 +202,42 @@ def decrypt_to_obj(source: str, passphrase: bytes) -> dict:
     return json.loads(plaintext.decode("utf-8"))
 
 
+def api_fallback_urls(source: str):
+    """
+    由 GitHub raw 地址推出走 Contents API 的备用地址。
+
+    raw.githubusercontent.com 有 CDN 缓存，刚推送的新密文可能几分钟后才生效，
+    期间会一直返回旧版密文，导致「口令不对」的假象。Contents API 不经过这层缓存。
+    """
+    m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$",
+                 source)
+    if not m:
+        return []
+    owner, repo, branch, path = m.groups()
+    return ["https://api.github.com/repos/%s/%s/contents/%s?ref=%s"
+            % (owner, repo, path, branch)]
+
+
+def fetch_decrypted(source: str, passphrase: bytes) -> dict:
+    """解密，raw CDN 返回旧密文时自动改用 API 地址重试"""
+    try:
+        return decrypt_to_obj(source, passphrase)
+    except ValueError as primary_error:
+        for alt in api_fallback_urls(source):
+            try:
+                data = decrypt_to_obj(alt, passphrase)
+            except Exception:
+                continue
+            print("提示：raw CDN 返回的是旧版密文，已自动改走 GitHub API 取到最新版",
+                  file=sys.stderr)
+            return data
+        raise primary_error
+
+
 # ---------------------------------------------------------------- 子命令
 
 def cmd_list(args):
-    data = decrypt_to_obj(read_source(args), read_passphrase(args))
+    data = fetch_decrypted(read_source(args), read_passphrase(args))
     if not data:
         print("(容器为空)")
         return
@@ -212,7 +255,7 @@ def cmd_list(args):
 
 
 def cmd_get(args):
-    data = decrypt_to_obj(read_source(args), read_passphrase(args))
+    data = fetch_decrypted(read_source(args), read_passphrase(args))
     for key in args.keys:
         if key not in data:
             print("未找到条目：%s" % key, file=sys.stderr)
@@ -230,7 +273,7 @@ def cmd_get(args):
 
 
 def cmd_dump(args):
-    data = decrypt_to_obj(read_source(args), read_passphrase(args))
+    data = fetch_decrypted(read_source(args), read_passphrase(args))
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
@@ -257,7 +300,7 @@ def cmd_encrypt(args):
 
 def cmd_decrypt_out(args):
     """把密文解成本地明文 JSON"""
-    data = decrypt_to_obj(read_source(args), read_passphrase(args))
+    data = fetch_decrypted(read_source(args), read_passphrase(args))
     text = json.dumps(data, ensure_ascii=False, indent=2)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
@@ -271,7 +314,7 @@ def cmd_edit(args):
     """解密 -> 编辑器修改 -> 重新加密"""
     source = read_source(args)
     passphrase = read_passphrase(args)
-    data = decrypt_to_obj(source, passphrase)
+    data = fetch_decrypted(source, passphrase)
 
     editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
     with tempfile.NamedTemporaryFile("w+", suffix=".json", encoding="utf-8", delete=False) as tf:
