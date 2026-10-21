@@ -1,0 +1,7 @@
+# 只忽略明文，密文 vault.enc 必须提交
+*.json
+!vault.example.json
+
+.env
+.DS_Store
+__pycache__/
