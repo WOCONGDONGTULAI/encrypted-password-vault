@@ -173,6 +173,19 @@ def read_source(args) -> str:
     return DEFAULT_URL
 
 
+def write_source(args) -> str:
+    """
+    写入类命令的读取源：本地文件优先。
+
+    防止连续写入时后一次覆盖前一次 —— 若上次写完没推送，
+    这次必须基于本地那份继续改，而不是重新拉远端旧版。
+    """
+    local = getattr(args, "file", DEFAULT_FILE)
+    if os.path.exists(local):
+        return local
+    return read_source(args)
+
+
 def read_passphrase(args) -> bytes:
     """确定口令"""
     candidate = getattr(args, "pass_arg", None) or os.environ.get(ENV_PASS)
@@ -204,10 +217,11 @@ def decrypt_to_obj(source: str, passphrase: bytes) -> dict:
 
 def api_fallback_urls(source: str):
     """
-    由 GitHub raw 地址推出走 Contents API 的备用地址。
+    由 GitHub raw 地址推出对应的 Contents API 地址。
 
     raw.githubusercontent.com 有 CDN 缓存，刚推送的新密文可能几分钟后才生效，
-    期间会一直返回旧版密文，导致「口令不对」的假象。Contents API 不经过这层缓存。
+    期间会返回「有效但过期」的旧密文 —— 它能被正常解开，只是内容落后，
+    所以不能靠「解不开」来发现。Contents API 不经过这层缓存，是权威源。
     """
     m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$",
                  source)
@@ -219,25 +233,35 @@ def api_fallback_urls(source: str):
 
 
 def fetch_decrypted(source: str, passphrase: bytes) -> dict:
-    """解密，raw CDN 返回旧密文时自动改用 API 地址重试"""
-    try:
-        return decrypt_to_obj(source, passphrase)
-    except ValueError as primary_error:
-        for alt in api_fallback_urls(source):
-            try:
-                data = decrypt_to_obj(alt, passphrase)
-            except Exception:
-                continue
-            print("提示：raw CDN 返回的是旧版密文，已自动改走 GitHub API 取到最新版",
-                  file=sys.stderr)
-            return data
-        raise primary_error
+    """
+    解密取数据。GitHub 仓库优先走 Contents API（权威、无 CDN 缓存），
+    API 不可用时（如匿名限流 60 次/小时）才退回 raw 地址。
+    """
+    ordered = api_fallback_urls(source) + [source]
+    last_error = None
+    for idx, url in enumerate(ordered):
+        try:
+            return decrypt_to_obj(url, passphrase)
+        except ValueError as e:
+            last_error = e
+            # 口令本身错了的话，换地址也没用
+            if "标签不匹配" in str(e) and idx == 0 and len(ordered) > 1:
+                decrypt_to_obj(source, passphrase)  # 用 raw 复核一次，排除 CDN 干扰
+    raise last_error
 
 
 # ---------------------------------------------------------------- 子命令
 
+def emit_json(obj):
+    """给 AI / 脚本用的机读输出，保证一行一个 JSON"""
+    print(json.dumps(obj, ensure_ascii=False))
+
+
 def cmd_list(args):
     data = fetch_decrypted(read_source(args), read_passphrase(args))
+    if getattr(args, "json", False):
+        emit_json(sorted(data.keys()))
+        return
     if not data:
         print("(容器为空)")
         return
@@ -256,6 +280,19 @@ def cmd_list(args):
 
 def cmd_get(args):
     data = fetch_decrypted(read_source(args), read_passphrase(args))
+    missing = [k for k in args.keys if k not in data]
+
+    if getattr(args, "json", False):
+        hit = {k: data[k] for k in args.keys if k in data}
+        if len(args.keys) == 1 and hit:
+            emit_json(hit[args.keys[0]])
+        else:
+            emit_json(hit)
+        if missing:
+            print("未找到条目：%s" % ", ".join(missing), file=sys.stderr)
+            sys.exit(1)
+        return
+
     for key in args.keys:
         if key not in data:
             print("未找到条目：%s" % key, file=sys.stderr)
@@ -270,6 +307,82 @@ def cmd_get(args):
                     print("%s: %s" % (extra.ljust(6), entry[extra]))
         else:
             print(entry)
+    if missing:
+        sys.exit(1)
+
+
+def _write_back(data: dict, passphrase: bytes, args) -> bool:
+    """重新加密落盘，并在有 token 且要求推送时同步到 GitHub"""
+    plaintext = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    blob = encrypt_bytes(plaintext, passphrase)
+    save_encrypted(blob, getattr(args, "file", DEFAULT_FILE))
+
+    if getattr(args, "push", False) and os.environ.get(ENV_TOKEN):
+        cmd_push(args)
+        return True
+    print("已写入本地 %s" % getattr(args, "file", DEFAULT_FILE), file=sys.stderr)
+    if getattr(args, "push", False):
+        print("（未设置 GITHUB_TOKEN，跳过推送）", file=sys.stderr)
+    return False
+
+
+def cmd_set(args):
+    """新增或更新一条（幂等），AI / 脚本主要用这个写"""
+    if not any([args.username, args.password, args.email, args.url,
+                args.otp, args.note, args.field]) and not args.replace:
+        sys.exit("错误：至少给一个要写入的字段")
+
+    passphrase = read_passphrase(args)
+    source = write_source(args)
+    try:
+        data = fetch_decrypted(source, passphrase)
+    except ValueError:
+        if getattr(args, "create", False):
+            data = {}
+        else:
+            raise
+
+    entry = data.get(args.key)
+    if not isinstance(entry, dict):
+        entry = {}
+    if args.replace:
+        entry = {}
+
+    for attr, key in (("username", "username"), ("password", "password"),
+                      ("email", "email"), ("url", "url"),
+                      ("otp", "otp"), ("note", "note")):
+        val = getattr(args, attr, None)
+        if val is not None:
+            entry[key] = val
+
+    for raw in getattr(args, "field", None) or []:
+        if "=" not in raw:
+            sys.exit("错误：--field 需要写成 key=value 形式：%s" % raw)
+        k, v = raw.split("=", 1)
+        entry[k.strip()] = v
+
+    created = args.key not in data
+    data[args.key] = entry
+
+    pushed = _write_back(data, passphrase, args)
+    emit_json({
+        "ok": True,
+        "key": args.key,
+        "action": "created" if created else "updated",
+        "pushed": pushed,
+        "entry": entry,
+    })
+
+
+def cmd_rm(args):
+    """删除一条"""
+    passphrase = read_passphrase(args)
+    data = fetch_decrypted(write_source(args), passphrase)
+    if args.key not in data:
+        sys.exit("错误：没有这个条目 %s" % args.key)
+    del data[args.key]
+    pushed = _write_back(data, passphrase, args)
+    emit_json({"ok": True, "key": args.key, "action": "deleted", "pushed": pushed})
 
 
 def cmd_dump(args):
@@ -341,26 +454,39 @@ def cmd_push(args):
     if not token:
         sys.exit("错误：请设置环境变量 GITHUB_TOKEN")
 
-    repo = args.repo
-    path = args.path
+    repo = getattr(args, "repo", None) or "WOCONGDONGTULAI/encrypted-password-vault"
+    path = getattr(args, "path", None) or "vault.enc"
     with open(getattr(args, "file", DEFAULT_FILE), "r", encoding="utf-8") as f:
         content = f.read()
 
     import urllib.error
-    payload = json.dumps({
+
+    api = "https://api.github.com/repos/%s/contents/%s" % (repo, path)
+    headers = {
+        "Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": "vault.py",
+    }
+
+    # 更新已有文件必须带上它当前的 sha，否则 GitHub 返回 422 "sha wasn't supplied"
+    body = {
         "message": "vault: update encrypted data",
         "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
-    }).encode("utf-8")
+    }
+    try:
+        probe = urllib.request.Request(api, headers=headers)
+        existing = json.load(urllib.request.urlopen(probe, timeout=30))
+        body["sha"] = existing["sha"]
+    except urllib.error.HTTPError:
+        pass  # 文件还不存在，新建即可
+    except Exception:
+        pass
 
     req = urllib.request.Request(
-        "https://api.github.com/repos/%s/contents/%s" % (repo, path),
-        data=payload,
-        headers={
-            "Authorization": "Bearer " + token,
-            "Accept": "application/vnd.github+json",
-            "Content-Type": "application/json",
-            "User-Agent": "vault.py",
-        },
+        api,
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
         method="PUT",
     )
     try:
@@ -419,22 +545,49 @@ def build_parser():
     )
     sub = p.add_subparsers(dest="cmd")
 
-    def add_common(sp):
+    def add_common(sp, source_url=True):
         sp.add_argument("--pass", dest="pass_arg", help="口令（也可用环境变量 VAULT_PASS）")
-        sp.add_argument("--url", help="密文远端地址（也可用 VAULT_URL）")
+        # set / rm 里 --url 是条目字段（网址），故写入类命令改用 --remote-url
+        sp.add_argument("--remote-url" if not source_url else "--url",
+                        dest="url",
+                        help="密文远端地址（也可用 VAULT_URL）")
         sp.add_argument("--file", default=DEFAULT_FILE, help="本地密文文件，默认 vault.enc")
         sp.add_argument("--local", action="store_true", help="读取本地密文而非远端")
 
+    def add_write(sp):
+        sp.add_argument("--push", action="store_true",
+                       help="写完后推到 GitHub（需 GITHUB_TOKEN）")
+
     sp = sub.add_parser("list", help="列出所有条目")
+    sp.add_argument("--json", action="store_true", help="输出 JSON 数组（给程序读）")
     add_common(sp); sp.set_defaults(func=cmd_list)
 
     sp = sub.add_parser("get", help="查看某个条目的密码")
     sp.add_argument("keys", nargs="+")
     sp.add_argument("--user", action="store_true", help="同时输出用户名")
+    sp.add_argument("--json", action="store_true", help="输出 JSON（给程序读）")
     add_common(sp); sp.set_defaults(func=cmd_get)
 
     sp = sub.add_parser("dump", help="导出全部明文 JSON")
     add_common(sp); sp.set_defaults(func=cmd_dump)
+
+    sp = sub.add_parser("set", help="新增或更新一条（幂等，写操作主要用这个）")
+    sp.add_argument("key")
+    sp.add_argument("--username")
+    sp.add_argument("--password")
+    sp.add_argument("--email")
+    sp.add_argument("--url")
+    sp.add_argument("--otp")
+    sp.add_argument("--note")
+    sp.add_argument("--field", action="append", metavar="K=V",
+                    help="任意额外字段，可重复")
+    sp.add_argument("--replace", action="store_true", help="整条覆盖而非合并")
+    sp.add_argument("--create", action="store_true", help="容器不存在时创建新的")
+    add_common(sp, source_url=False); add_write(sp); sp.set_defaults(func=cmd_set)
+
+    sp = sub.add_parser("rm", help="删除一条")
+    sp.add_argument("key")
+    add_common(sp, source_url=False); add_write(sp); sp.set_defaults(func=cmd_rm)
 
     sp = sub.add_parser("encrypt", help="把本地明文 JSON 加密成密文")
     sp.add_argument("input", help="明文 JSON 文件，- 表示 stdin")
